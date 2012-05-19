@@ -29,6 +29,7 @@
 #include "sock_util.h"
 #include "w_epoll.h"
 #include "http_parser.h"
+#include "mytests.h"
 
 #include <sys/wait.h>
 
@@ -237,7 +238,6 @@ enum connection_state prepare_response(struct connection *conn) {
 		goto send_404;
 	}
 	else {
-		sprintf(request_path, "static/small00.dat");
 		printf("path is %s\n", request_path);
 		fd = open(request_path, O_RDONLY);
 		if (fd < 0)
@@ -322,12 +322,14 @@ static void set_socket_non_blocking(int sockfd) {
 
 int main(void) {
 	int rc;
-	
+
 	/* set root directory */
 	rc = chroot(AWS_DOCUMENT_ROOT);
 	DIE(rc != 0, "chroot");
 	setenv("PWD", AWS_DOCUMENT_ROOT, 1);
 	printf("%s\n", getenv("PWD"));
+
+test_files_in_crt_dir();
 
 	/* init multiplexing */
 	epollfd = w_epoll_create();
