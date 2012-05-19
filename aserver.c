@@ -35,7 +35,8 @@
 
 #define HTTP_404		"HTTP/1.1 404\r\n"
 #define HTTP_OK			"HTTP/1.1 200 OK\r\n"
-#define HTTP_CHUNK		"Transfer-Encoding: chunked\r\n"
+#define HTTP_LEN		"Content-Length: "
+#define HTTP_CLOSE		"Connection: close\r\n"
 #define FLAG_404		-2
 #define FLAG_200		-1
 #define static_folder		AWS_DOCUMENT_ROOT AWS_REL_STATIC_FOLDER
@@ -187,37 +188,50 @@ void handle_client_request(struct connection *conn) {
 
 	/* add socket to epoll for out events */
 	rc = w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
-	DIE(rc < 0, "w_epoll_add_ptr_inout");
+	DIE(rc < 0, "w_epoll_update_ptr_inout");
 
 }
 
-static int sendfile_static(int fd, struct connection *conn) {
+
+static int send_chunk(struct connection *conn) {
 	size_t rc, count;
-	int ret;
+	int ret, fd;
 	struct stat buf;
-	
-	dlog(LOG_ERR, "sendfile static\n");
+
+	fd = open(conn->path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+
 	ret = fstat(fd, &buf);
 	DIE(ret == -1, "fstat");
 	count = buf.st_size;
-	
-	if (conn->send_len == -1) {
-		rc = send(conn->sockfd, HTTP_OK, strlen(HTTP_OK), 0);
+
+	if (conn->send_len == FLAG_200) {
+		sprintf(conn->send_buffer, "%s%s%u\r\n\r\n", HTTP_OK, HTTP_LEN, 
+			count);
+		rc = send(conn->sockfd, conn->send_buffer, 
+			strlen(conn->send_buffer), 0);
 		DIE(rc == -1, "send");
 		if (rc == 0) {
 			conn->send_len = FLAG_200;
+			close(fd);
 			return 0;
 		}
 		conn->send_len = 0;
 	}
-	
-	rc = sendfile(conn->sockfd, fd, &(conn->send_len), count - conn->send_len);
+
+	rc = sendfile(conn->sockfd, fd, &(conn->send_len), 
+		count - conn->send_len);
 	DIE(rc == -1, "sendfile");
-	
-	if (rc < count - conn->send_len) {
-		conn->send_len += rc;
+
+	dlog(LOG_ERR, "sent %i bytes out of %u\n", conn->send_len, 
+		(unsigned int)buf.st_size);
+	if (conn->send_len < buf.st_size) {		
+		close(fd);
 		return 0;
 	}
+	
+	close(fd);
 	
 	return 1;
 }
@@ -226,37 +240,35 @@ static int sendfile_static(int fd, struct connection *conn) {
  */
 enum connection_state prepare_response(struct connection *conn) {
 	size_t bytes_parsed;
-	char complex_request[BUFSIZ];
-	int fd, bRet;
+	int rc;
 
-	strcpy(complex_request, conn->recv_buffer);
 	http_parser_init(&request_parser, HTTP_REQUEST);
 
-	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
+	bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, 
+			conn->recv_buffer, conn->recv_len);
 
 	if (bytes_parsed <= 0) {
 		goto send_404;
 	}
-	else {
-		printf("path is %s\n", request_path);
-		fd = open(request_path, O_RDONLY);
-		if (fd < 0)
-			goto send_404;
+	
+	printf("path is %s\n", request_path);
+	strcpy(conn->path, request_path);
 
-		if (strstr(request_path, static_folder) == 0) {
-			bRet = sendfile_static(fd, conn);
-			close(fd);
-			if (bRet) {
-				remove_conn(conn);
-				dlog(LOG_ERR, "sent file %s\n", request_path);
-				return STATE_CONNECTION_CLOSED;
-			}
-			
-			return STATE_DATA_SENT;
-		}		
-		conn->state = STATE_DATA_SENT;
-		close(fd);
+	//TODO case static, case 
+	rc = send_chunk(conn);
+	if (rc < 0) 
+		goto send_404;
+	if (rc) {
+		remove_conn(conn);
+		dlog(LOG_ERR, "sent file %s\n", conn->path);
+		return STATE_CONNECTION_CLOSED;
 	}
+	else {	
+		/*rc = w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
+		DIE(rc < 0, "w_epoll_update_ptr_out");*/
+		return STATE_DATA_SENT;
+	}		
+	
 send_404:
 	dlog(LOG_ERR, "%s\n", HTTP_404);
 	sprintf(conn->send_buffer, "%s", HTTP_404);
@@ -275,13 +287,20 @@ void send_reply(struct connection *conn) {
 	int rc, sockfd = conn->sockfd;
 	char buffer[BUFSIZ];
 	
+	dlog(LOG_ERR, "send_reply\n");
+	
 	if (conn->send_len == FLAG_404)
 		sprintf(buffer, "%s", conn->send_buffer);
-	else
-		if (conn->send_len == FLAG_200) {
-			//TODO continue send file static or dynamic
-			return;
+	else {
+		if (send_chunk(conn) == 1) {
+			remove_conn(conn);
 		}
+		else {
+			rc = w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
+			DIE(rc < 0, "w_epoll_update_ptr_out");
+		}
+		return;
+	}
 
 	rc = get_peer_address(sockfd, abuffer, 64);
 	if (rc < 0) {
@@ -348,9 +367,6 @@ test_files_in_crt_dir();
 	/* add server socket to epoll set to listen for new connections */
 	rc = w_epoll_add_fd_in(epollfd, listenfd);
 	DIE(rc < 0, "w_epoll_add_fd_in");
-	
-	rc = w_epoll_add_fd_in(epollfd, STDIN_FILENO);
-	DIE(rc < 0, "w_epoll_add_fd_in");
 
 	dlog(LOG_INFO, "Server waiting for connections on port %d\n",
 		 AWS_LISTEN_PORT);
@@ -372,14 +388,6 @@ test_files_in_crt_dir();
 			dlog(LOG_DEBUG, "New connection\n");
 			if (rev.events & EPOLLIN)
 				handle_new_connection();
-		}
-		else if (rev.data.fd == STDIN_FILENO) { //TODO not working
-			dlog(LOG_DEBUG, "Stdin message\n");
-			char buffer[BUFSIZ];
-			recv(rev.data.fd, buffer, BUFSIZ, 0);
-			if (strcmp(buffer, "exit") == 0)
-				break;
-			dlog(LOG_DEBUG, "stdin msg %s\n", buffer);
 		}
 		else {
 			if (rev.events & EPOLLIN) {

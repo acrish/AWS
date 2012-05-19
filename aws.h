@@ -45,6 +45,7 @@ struct connection {
 	size_t recv_len;
 	char send_buffer[BUFSIZ];
 	int send_len;
+	char path[BUFSIZ];
 	enum connection_state state;
 };
 
