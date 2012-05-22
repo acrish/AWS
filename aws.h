@@ -40,6 +40,7 @@ enum 	connection_state {
 struct connection {
 	int sockfd;
 	int event_fd;
+	int async_fd;
 	/* buffers used for receiving messages and then replying them back */
 	char recv_buffer[BUFSIZ];
 	size_t recv_len;
